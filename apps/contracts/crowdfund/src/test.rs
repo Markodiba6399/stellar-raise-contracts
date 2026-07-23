@@ -564,6 +564,7 @@ fn test_initialize_rejects_full_drain_platform_fee() {
         }),
         &None,
         &None,
+        &7,
     );
 
     assert_eq!(
@@ -593,6 +594,7 @@ fn test_withdraw_with_max_valid_fee_leaves_nonzero_creator_payout() {
         }),
         &None,
         &None,
+        &7,
     );
 
     let contributor = Address::generate(&env);

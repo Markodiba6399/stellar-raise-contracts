@@ -64,6 +64,7 @@ fn setup() -> (
         &None,
         &None,
         &None,
+        &7,
     );
 
     let verifier_id = env.register(MockKycVerifier, ());

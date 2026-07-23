@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use soroban_sdk::{Address, Env, Vec};
+use soroban_sdk::{Address, Env, Symbol, Vec};
 
 use crate::{ContractError, DataKey, KycGateConfig, NftContractClient, MAX_NFT_MINT_BATCH};
 
@@ -43,6 +43,21 @@ pub fn emit_refunded(env: &Env, backer: &Address, amount: i128) {
 
 pub fn emit_cancelled(env: &Env) {
     env.events().publish(("crowdfund", "cancelled"), ());
+}
+
+// ── transfer_skipped ─────────────────────────────────────────────────────────
+
+/// Emitted when a per-entry transfer inside a batch operation
+/// (`collect_pledges`, `refund`, `cancel`) fails — e.g. the counterparty is a
+/// blocklisted address on a compliance-gated SEP-41 token — and is skipped
+/// rather than reverting the whole batch. The entry's storage is left intact
+/// (not zeroed) so it can be retried later, either by re-running the batch
+/// operation or via the pull-based `refund_single` path.
+pub fn emit_transfer_skipped(env: &Env, participant: &Address, amount: i128, context: Symbol) {
+    env.events().publish(
+        ("crowdfund", "transfer_skipped"),
+        (participant.clone(), amount, context),
+    );
 }
 
 // ── stretch_goal_reached ─────────────────────────────────────────────────────

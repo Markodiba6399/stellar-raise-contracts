@@ -9,7 +9,7 @@ use soroban_sdk::{
 
 use withdraw_event_emission::{
     emit_cancelled, emit_contributed, emit_fee_transferred, emit_goal_reached, emit_refunded,
-    emit_stretch_goal_reached, emit_withdrawn, mint_nfts_in_batch,
+    emit_stretch_goal_reached, emit_transfer_skipped, emit_withdrawn, mint_nfts_in_batch,
 };
 
 // --- Modules ---
@@ -30,13 +30,13 @@ use milestone_release::{
     execute_claim_milestone_refund, execute_finalize_milestone_vote,
     execute_propose_milestones, execute_release_milestone, execute_vote_milestone,
 };
-use refund_single_token::{
-    execute_refund_single, refund_single_transfer, validate_refund_preconditions,
-};
+use refund_single_token::{execute_refund_single, validate_refund_preconditions};
 
 // --- Tests ---
 #[cfg(test)]
 mod auth_tests;
+#[cfg(test)]
+mod blocklist_transfer_test;
 #[cfg(test)]
 mod kyc_gate_test;
 #[cfg(test)]
@@ -248,6 +248,12 @@ pub enum DataKey {
     PlatformConfig,
     NFTContract,
     TokenDecimals,
+    Milestones,
+    MilestoneBasis,
+    MilestoneVote(MilestoneVoteKey),
+    MilestoneRefundClaimed(MilestoneRefundKey),
+    KycGate,
+    PreviousWasmHash,
 }
 
 /// Extend the TTL for a single **persistent** storage key.
@@ -320,6 +326,9 @@ pub enum ContractError {
     /// `set_kyc_gate_enabled` called before `configure_kyc_gate` has ever
     /// been called for this campaign.
     KycGateNotConfigured = 29,
+    /// `initialize` called with a `token` address that doesn't implement
+    /// the SEP-41 token interface (fail-fast check via `validate_token_address`).
+    InvalidTokenAddress = 30,
 }
 
 #[contractclient(name = "NftContractClient")]
@@ -698,30 +707,55 @@ impl CrowdfundContract {
             .get(&DataKey::Pledgers)
             .unwrap_or_else(|| Vec::new(&env));
 
-        // Collect pledges from all pledgers
+        // Collect pledges from all pledgers. A pledger's transfer may fail
+        // (e.g. a blocklisted address on a compliance-gated SEP-41 token) —
+        // `try_transfer` catches that instead of reverting the whole batch,
+        // and the failing entry is left in place so it can be retried later.
+        let mut collected_total: i128 = 0;
         for pledger in pledgers.iter() {
             let pledge_key = DataKey::Pledge(pledger.clone());
             let amount: i128 = env.storage().persistent().get(&pledge_key).unwrap_or(0);
             if amount > 0 {
-                // Transfer tokens from pledger to contract
-                token_client.transfer(&pledger, env.current_contract_address(), &amount);
-
-                // Clear the pledge
+                // Effect before interaction: clear the pledge first so a
+                // reentrant call sees nothing owed.
                 env.storage().persistent().set(&pledge_key, &0i128);
-                bump_persistent(&env, &pledge_key);
+
+                match token_client.try_transfer(&pledger, env.current_contract_address(), &amount)
+                {
+                    Ok(Ok(())) => {
+                        bump_persistent(&env, &pledge_key);
+                        collected_total = collected_total
+                            .checked_add(amount)
+                            .expect("pledge collection overflow");
+                    }
+                    _ => {
+                        // Transfer failed — restore the pledge so it remains
+                        // retryable on a future call.
+                        env.storage().persistent().set(&pledge_key, &amount);
+                        bump_persistent(&env, &pledge_key);
+                        emit_transfer_skipped(
+                            &env,
+                            &pledger,
+                            amount,
+                            Symbol::new(&env, "collect_pledges"),
+                        );
+                    }
+                }
             }
         }
 
-        // Update total raised to include collected pledges
+        // Update total raised/pledged to reflect only the pledges actually
+        // collected — any skipped entries remain pledged for a later attempt.
         env.storage()
             .instance()
-            .set(&DataKey::TotalRaised, &(total_raised + total_pledged));
-
-        // Reset total pledged
-        env.storage().instance().set(&DataKey::TotalPledged, &0i128);
+            .set(&DataKey::TotalRaised, &(total_raised + collected_total));
+        env.storage().instance().set(
+            &DataKey::TotalPledged,
+            &(total_pledged - collected_total),
+        );
 
         env.events()
-            .publish(("crowdfund", "pledges_collected"), total_pledged);
+            .publish(("crowdfund", "pledges_collected"), collected_total);
 
         Ok(())
     }
@@ -841,6 +875,8 @@ impl CrowdfundContract {
             .get(&DataKey::Contributors)
             .unwrap();
 
+        let mut refunded_total: i128 = 0;
+        let mut skipped_count: u32 = 0;
         for contributor in contributors.iter() {
             let contribution_key = DataKey::Contribution(contributor.clone());
             let amount: i128 = env
@@ -849,22 +885,46 @@ impl CrowdfundContract {
                 .get(&contribution_key)
                 .unwrap_or(0);
             if amount > 0 {
-                refund_single_transfer(
-                    &token_client,
+                // Effect before interaction: zero the contribution first so a
+                // reentrant call sees nothing owed.
+                env.storage().persistent().set(&contribution_key, &0i128);
+
+                match token_client.try_transfer(
                     &env.current_contract_address(),
                     &contributor,
-                    amount,
-                );
-                env.storage().persistent().set(&contribution_key, &0i128);
-                bump_persistent(&env, &contribution_key);
-                emit_refunded(&env, &contributor, amount);
+                    &amount,
+                ) {
+                    Ok(Ok(())) => {
+                        bump_persistent(&env, &contribution_key);
+                        refunded_total = refunded_total
+                            .checked_add(amount)
+                            .expect("refund total overflow");
+                        emit_refunded(&env, &contributor, amount);
+                    }
+                    _ => {
+                        // Transfer failed (e.g. blocklisted address) —
+                        // restore the contribution so it remains retryable.
+                        env.storage().persistent().set(&contribution_key, &amount);
+                        bump_persistent(&env, &contribution_key);
+                        skipped_count += 1;
+                        emit_transfer_skipped(&env, &contributor, amount, Symbol::new(&env, "refund"));
+                    }
+                }
             }
         }
 
-        env.storage().instance().set(&DataKey::TotalRaised, &0i128);
-        env.storage()
-            .instance()
-            .set(&DataKey::Status, &Status::Refunded);
+        let new_total = total
+            .checked_sub(refunded_total)
+            .expect("total_raised underflow");
+        env.storage().instance().set(&DataKey::TotalRaised, &new_total);
+        // Only mark the campaign fully Refunded once every contributor has
+        // actually been paid out; otherwise leave it Active so `refund` can
+        // be retried later (or stragglers can self-serve via `refund_single`).
+        if skipped_count == 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::Status, &Status::Refunded);
+        }
 
         Ok(())
     }
@@ -918,12 +978,20 @@ impl CrowdfundContract {
         let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_address);
 
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalRaised)
+            .unwrap_or(0);
+
         let contributors: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::Contributors)
             .unwrap_or_else(|| Vec::new(&env));
 
+        let mut refunded_total: i128 = 0;
+        let mut skipped_count: u32 = 0;
         for contributor in contributors.iter() {
             let contribution_key = DataKey::Contribution(contributor.clone());
             let amount: i128 = env
@@ -932,22 +1000,48 @@ impl CrowdfundContract {
                 .get(&contribution_key)
                 .unwrap_or(0);
             if amount > 0 {
+                // Effect before interaction: zero the contribution first so a
+                // reentrant call sees nothing owed.
                 env.storage().persistent().set(&contribution_key, &0i128);
-                refund_single_transfer(
-                    &token_client,
+
+                match token_client.try_transfer(
                     &env.current_contract_address(),
                     &contributor,
-                    amount,
-                );
-                emit_refunded(&env, &contributor, amount);
+                    &amount,
+                ) {
+                    Ok(Ok(())) => {
+                        bump_persistent(&env, &contribution_key);
+                        refunded_total = refunded_total
+                            .checked_add(amount)
+                            .expect("refund total overflow");
+                        emit_refunded(&env, &contributor, amount);
+                    }
+                    _ => {
+                        // Transfer failed (e.g. blocklisted address) —
+                        // restore the contribution so it remains retryable.
+                        env.storage().persistent().set(&contribution_key, &amount);
+                        bump_persistent(&env, &contribution_key);
+                        skipped_count += 1;
+                        emit_transfer_skipped(&env, &contributor, amount, Symbol::new(&env, "cancel"));
+                    }
+                }
             }
         }
 
-        env.storage().instance().set(&DataKey::TotalRaised, &0i128);
-        env.storage()
-            .instance()
-            .set(&DataKey::Status, &Status::Cancelled);
-        emit_cancelled(&env);
+        let new_total = total
+            .checked_sub(refunded_total)
+            .expect("total_raised underflow");
+        env.storage().instance().set(&DataKey::TotalRaised, &new_total);
+        // Only mark the campaign fully Cancelled once every contributor has
+        // actually been paid out; otherwise leave it Active so `cancel` can
+        // be retried later (or stragglers can self-serve via `refund_single`
+        // once the deadline passes).
+        if skipped_count == 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::Status, &Status::Cancelled);
+            emit_cancelled(&env);
+        }
         Ok(())
     }
 

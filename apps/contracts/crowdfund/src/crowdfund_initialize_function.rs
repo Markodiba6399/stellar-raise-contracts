@@ -74,16 +74,13 @@ pub fn validate_bonus_goal(bonus_goal: Option<i128>, goal: i128) -> Result<(), C
 #[inline]
 pub fn validate_token_address(env: &Env, token_address: &Address) -> Result<(), ContractError> {
     let client = token::Client::new(env, token_address);
-    // A cheap read-only call that will fail (panic) if the address
-    // does not implement the SEP-41 token interface. We catch the
-    // panic by converting to a Result via try_call / env.try().
-    let result = env.try(|e| {
-        let c = token::Client::new(e, token_address);
-        c.name();
-    });
-    match result {
-        Ok(_) => Ok(()),
-        Err(_) => Err(ContractError::InvalidTokenAddress),
+    // A cheap read-only call that will fail if the address does not
+    // implement the SEP-41 token interface. `try_name` (SDK-generated,
+    // backed by `env.try_invoke_contract`) catches that instead of
+    // panicking the whole `initialize` call.
+    match client.try_name() {
+        Ok(Ok(_)) => Ok(()),
+        _ => Err(ContractError::InvalidTokenAddress),
     }
 }
 
